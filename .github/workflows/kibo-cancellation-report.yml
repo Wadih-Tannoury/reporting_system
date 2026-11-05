@@ -1,0 +1,168 @@
+name: Kibo cancellation report
+
+# Builds the daily canceled-shipments workbook and emails it to the DJ team.
+# Runs daily and can be started by hand from the Actions tab.
+#
+# GitHub cron is UTC and does not follow daylight saving, so 08:00 in Milan is
+# 07:00 UTC in winter and 06:00 UTC in summer. Both are scheduled and the guard
+# step below drops whichever one is not 08:00 local, so the report lands at the
+# same wall-clock time all year.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to run"
+        required: true
+        default: "run"
+        type: choice
+        options:
+          - run                # build the report and email it
+          - report-only        # build the report, no email
+          - smtp-login-test    # test SMTP auth only, build nothing
+      hours:
+        description: "Hours to look back from now (UTC). Ignored if 'from' is set."
+        required: false
+        default: "24"
+      from:
+        description: "Backfill start, YYYY-MM-DD or ISO timestamp (UTC). Optional."
+        required: false
+        default: ""
+      to:
+        description: "Backfill end, YYYY-MM-DD or ISO timestamp (UTC). Optional, defaults to now."
+        required: false
+        default: ""
+      dry_run:
+        description: "Log the email instead of sending it"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "0 6 * * *"   # 08:00 Europe/Rome while CEST is in force
+    - cron: "0 7 * * *"   # 08:00 Europe/Rome while CET is in force
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kibo-cancellation-report
+  cancel-in-progress: false
+
+env:
+  MODE: ${{ inputs.mode || 'run' }}
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Drop the scheduled run that is not 08:00 in Milan
+        id: guard
+        if: github.event_name == 'schedule'
+        run: |
+          hour=$(TZ=Europe/Rome date +%H)
+          if [ "$hour" != "08" ]; then
+            echo "It is ${hour}:00 in Milan, not 08:00. Skipping this trigger."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "It is 08:00 in Milan. Running."
+          fi
+
+      - name: Check out the repository
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.guard.outputs.skip != 'true'
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Test the SMTP login
+        if: steps.guard.outputs.skip != 'true' && env.MODE == 'smtp-login-test'
+        env:
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_HOST: ${{ vars.SMTP_HOST }}
+          SMTP_PORT: ${{ vars.SMTP_PORT }}
+          SMTP_STARTTLS: ${{ vars.SMTP_STARTTLS }}
+          SMTP_AUTH_MECHANISM: ${{ vars.SMTP_AUTH_MECHANISM }}
+          SMTP_REMOVE_PASSWORD_SPACES: ${{ vars.SMTP_REMOVE_PASSWORD_SPACES }}
+          EMAIL_FROM: ${{ vars.EMAIL_FROM }}
+        run: python scripts/send_report_email.py --login-test
+
+      - name: Build the cancellation report
+        id: report
+        if: steps.guard.outputs.skip != 'true' && env.MODE != 'smtp-login-test'
+        env:
+          KIBO_API_CREDS: ${{ secrets.KIBO_API_CREDS }}
+          # Optional overrides; the defaults in the script match the original run.
+          KIBO_TENANT_ID: "30018"
+          LOOKBACK_HOURS: "24"
+          UPDATE_WINDOW_PADDING_DAYS: "7"
+          OUTPUT_DIR: output
+          # Via env, never interpolated into the command line.
+          INPUT_FROM: ${{ inputs.from }}
+          INPUT_TO: ${{ inputs.to }}
+          INPUT_HOURS: ${{ inputs.hours }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -n "${INPUT_FROM:-}" ];  then args+=(--from "$INPUT_FROM");   fi
+          if [ -n "${INPUT_TO:-}" ];    then args+=(--to "$INPUT_TO");       fi
+          if [ -n "${INPUT_HOURS:-}" ]; then args+=(--hours "$INPUT_HOURS"); fi
+          python scripts/kibo_cancellation_report.py ${args[@]+"${args[@]}"}
+
+      - name: Upload the Excel file
+        if: steps.guard.outputs.skip != 'true' && env.MODE != 'smtp-login-test'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kibo-cancellations-${{ github.run_id }}
+          path: output/*.xlsx
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Email the report
+        id: email
+        if: steps.guard.outputs.skip != 'true' && env.MODE == 'run'
+        env:
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_HOST: ${{ vars.SMTP_HOST }}
+          SMTP_PORT: ${{ vars.SMTP_PORT }}
+          SMTP_STARTTLS: ${{ vars.SMTP_STARTTLS }}
+          SMTP_AUTH_MECHANISM: ${{ vars.SMTP_AUTH_MECHANISM }}
+          SMTP_REMOVE_PASSWORD_SPACES: ${{ vars.SMTP_REMOVE_PASSWORD_SPACES }}
+          EMAIL_FROM: ${{ vars.EMAIL_FROM }}
+          # Repository variable EMAIL_RECIPIENTS overrides the list baked into
+          # scripts/send_report_email.py. Leave it unset to use the DJ team.
+          EMAIL_RECIPIENTS: ${{ vars.EMAIL_RECIPIENTS }}
+          EMAIL_DRY_RUN: ${{ inputs.dry_run || vars.EMAIL_DRY_RUN }}
+          REPORT_PATH: ${{ steps.report.outputs.report_path }}
+          WINDOW_START: ${{ steps.report.outputs.window_start }}
+          WINDOW_END: ${{ steps.report.outputs.window_end }}
+        run: |
+          python scripts/send_report_email.py \
+            --file "$REPORT_PATH" \
+            --subject "DJ daily cancellation report" \
+            --window-start "$WINDOW_START" \
+            --window-end "$WINDOW_END"
+
+      - name: Write the run summary
+        if: always() && steps.guard.outputs.skip != 'true' && env.MODE != 'smtp-login-test'
+        run: |
+          {
+            echo "### Kibo cancellation report"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Window (UTC) | ${{ steps.report.outputs.window_start }} → ${{ steps.report.outputs.window_end }} |"
+            echo "| Rows | ${{ steps.report.outputs.row_count }} |"
+            echo "| File | \`${{ steps.report.outputs.report_name }}\` |"
+            echo "| Emailed | ${{ steps.email.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
