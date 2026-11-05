@@ -8,14 +8,23 @@ Every day at 08:00 Europe/Rome, the workflow walks all ten sites of the tenant,
 collects the shipments canceled in the **last 24 hours** (by `cancellation_date`,
 not by last update), and emails an `.xlsx` with three sheets:
 
+Shipments on the **B2B channel are excluded**. Kibo carries the sales channel
+per item at `data.channel` (`Blooming`, `ecommerce`); the shipment's own
+`data.channel` is the integration that created it (`Order Connector`) and is
+used only when no item carries a channel. The filter works line by line: a mixed shipment keeps
+its non-B2B lines and loses the rest. A row whose channel cannot be determined
+is kept, so an unexpected payload never silently empties the report. The run log
+reports how many rows were dropped.
+
 | Sheet | Contents |
 |---|---|
 | `cancellations` | every canceled item |
 | `full` | shipments whose status is `CANCELED` |
 | `partial` | shipments in another status carrying canceled items |
 
-Columns are unchanged from the original script, `cancellation_type` through
-`shipment_number`, including `item_location_history`.
+Columns are those of the original script, `cancellation_type` through
+`shipment_number`, including `item_location_history`, plus a `channel` column so
+the exclusion can be audited.
 
 The workbook goes out as **DJ daily cancellation report** to:
 
@@ -76,6 +85,9 @@ and a body saying so.
 - **hours** — look back this many hours instead of 24.
 - **from** / **to** — a specific window, `YYYY-MM-DD` or an ISO timestamp, UTC.
   `from` wins over `hours`, and `to` defaults to now. Use these for a backfill.
+  A bare date in **to** means the *end* of that day, so `to = 2026-05-08`
+  includes cancellations made during the 8th. Pass a full timestamp
+  (`2026-05-08T12:00:00`) to cut the window mid-day instead.
 - **dry run** — log the email instead of sending it, so the five recipients are
   not disturbed by a test.
 
@@ -123,6 +135,7 @@ Set these as `env:` on the report step, or shell variables locally.
 | `KIBO_TENANT_ID` | `30018` | Tenant |
 | `KIBO_SITE_IDS` | the ten sites | Comma-separated override |
 | `ALWAYS_WRITE_FILE` | `true` | Write an empty workbook when nothing was canceled, so the artifact always exists. Set `false` to skip the upload instead — the upload step then fails on a quiet day, since `if-no-files-found` is `error` |
+| `EXCLUDE_CHANNELS` | `B2B` | Comma-separated channels to drop, case insensitive. Set to empty to keep every channel |
 | `EMAIL_RECIPIENTS` | the five DJ addresses | Comma-separated override |
 | `EMAIL_SUBJECT` | `DJ daily cancellation report` | Overridden by `--subject`, which the workflow passes explicitly |
 | `EMAIL_DRY_RUN` | `false` | Log the email instead of sending it |
