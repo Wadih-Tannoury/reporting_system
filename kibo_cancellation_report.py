@@ -76,6 +76,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from collections import defaultdict
@@ -159,6 +160,19 @@ EXTRA_FILTER: Optional[str] = None
 INCLUDE_FULL = True
 INCLUDE_PARTIAL = True
 
+# --- channel exclusion ----------------------------------------------------- #
+# Kibo carries the channel per item, at data.channel ("ecommerce", "B2B", ...),
+# not on the shipment. A row whose channel matches one of these, case
+# insensitively, is dropped. An item with no channel of its own inherits the
+# shipment's; a row whose channel cannot be determined at all is kept, so an
+# unexpected payload shape never silently empties the report.
+EXCLUDED_CHANNELS = {
+    part.strip().lower()
+    for part in os.environ.get("EXCLUDE_CHANNELS", "B2B").split(",")
+    if part.strip()
+}
+CHANNEL_FIELD = "channel"
+
 # --- location history ------------------------------------------------------ #
 # Ask Kibo for the other shipments of each affected order, so the history is
 # complete even when a sibling shipment fell outside the date window. Set to
@@ -239,6 +253,23 @@ def parse_cli_date(text: str) -> datetime:
         raise argparse.ArgumentTypeError(
             f"Not a date I can read: {text!r}. Use YYYY-MM-DD or an ISO timestamp."
         ) from exc
+
+
+DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def parse_cli_end_date(text: str) -> datetime:
+    """
+    The window end, where a bare YYYY-MM-DD means the end of that day.
+
+    "--to 2026-05-08" reads naturally as "through the 8th", but a bare date
+    parses to midnight, which would silently drop every cancellation made that
+    day. A full timestamp is taken exactly as written.
+    """
+    value = parse_cli_date(text)
+    if DATE_ONLY_RE.match(text.strip()):
+        value = value.replace(hour=23, minute=59, second=59)
+    return value
 
 
 def _parse_timestamp(value: Any) -> Optional[datetime]:
@@ -691,6 +722,41 @@ def item_location(shipment: dict, product_code: Optional[str]) -> Optional[str]:
     return fulfillment_location(shipment)
 
 
+def shipment_channel(shipment: dict) -> Optional[str]:
+    """
+    The shipment's sales channel, taken from its items.
+
+    Item-level data.channel is the sales channel ("Blooming", "ecommerce").
+    The shipment's own data.channel is a different thing: it names the
+    integration that created the shipment ("Order Connector"), so it is only a
+    last resort, used when no item carries a channel at all.
+    """
+    for bucket in ITEM_BUCKETS:
+        for item in shipment.get(bucket) or []:
+            item_value = (item.get("data") or {}).get(CHANNEL_FIELD)
+            if item_value:
+                return str(item_value)
+    value = (shipment.get("data") or {}).get(CHANNEL_FIELD)
+    return str(value) if value else None
+
+
+def item_channel(shipment: dict, product_code: Optional[str]) -> Optional[str]:
+    """This product's own channel, falling back to the shipment's."""
+    if product_code:
+        for bucket in ITEM_BUCKETS:
+            for item in shipment.get(bucket) or []:
+                if str(item.get("productCode")) == str(product_code):
+                    value = (item.get("data") or {}).get(CHANNEL_FIELD)
+                    if value:
+                        return str(value)
+    return shipment_channel(shipment)
+
+
+def is_excluded_channel(channel: Optional[str]) -> bool:
+    """True only for a known, excluded channel. Unknown channels are kept."""
+    return bool(channel) and channel.strip().lower() in EXCLUDED_CHANNELS
+
+
 def shipment_order_number_of(shipment: dict) -> Optional[str]:
     data = shipment.get("data") or {}
     return data.get("shipmentOrderNumber") or data.get("xpoOrderId")
@@ -815,6 +881,7 @@ COLUMNS = [
     "item_location_count",
     "is_full_order_cancelled",
     "shipment_status",
+    "channel",
     "site_id",
     "shipment_number",
 ]
@@ -824,14 +891,17 @@ def extract_rows(
     site_id: int,
     shipments: Sequence[dict],
     history: LocationHistory,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], int]:
     """
-    One record per canceled item.
+    One record per canceled item, plus the number of rows dropped by channel.
 
     A shipment qualifies when its status is CANCELED (full cancellation) or
-    when it carries canceled items despite another status (partial).
+    when it carries canceled items despite another status (partial). Rows on an
+    excluded channel (B2B by default) are dropped before the location-history
+    lookup, so they cost no extra API calls.
     """
     rows: List[Dict[str, Any]] = []
+    excluded = 0
 
     for shipment in shipments:
         status = str(shipment.get("shipmentStatus", "")).upper()
@@ -849,6 +919,7 @@ def extract_rows(
         costs = line_item_costs(shipment)
         location = fulfillment_location(shipment)
         full_order = is_full_cancellation(shipment)
+        channel = shipment_channel(shipment)
 
         common = {
             "cancellation_type": "FULL" if full else "PARTIAL",
@@ -858,6 +929,7 @@ def extract_rows(
             "fulfillment_location_code": location,
             "is_full_order_cancelled": full_order,
             "shipment_status": shipment.get("shipmentStatus"),
+            "channel": channel,
             "site_id": site_id,
             "shipment_number": shipment.get("shipmentNumber"),
         }
@@ -865,6 +937,9 @@ def extract_rows(
         if not canceled_items:
             # CANCELED with an empty canceledItems array: keep the shipment
             # visible instead of letting it drop out silently.
+            if is_excluded_channel(channel):
+                excluded += 1
+                continue
             audit = shipment.get("auditInfo") or {}
             trail, count = history.for_item(site_id, order_id, None)
             rows.append(
@@ -886,6 +961,14 @@ def extract_rows(
             audit = item.get("auditInfo") or {}
             item_reason = item.get("canceledReason") or {}
             product_code = item.get("productCode")
+
+            # The line's own channel leads, so a mixed shipment loses only its
+            # B2B lines. Checked before the history lookup to save the call.
+            line_channel = (item.get("data") or {}).get(CHANNEL_FIELD) or channel
+            if is_excluded_channel(line_channel):
+                excluded += 1
+                continue
+
             cost = item.get("lineItemCost")
             if cost is None and product_code:
                 cost = costs.get(str(product_code))
@@ -913,10 +996,11 @@ def extract_rows(
                     "fulfillment_location_code": item.get("fulfillmentLocationCode") or location,
                     "item_location_history": trail,
                     "item_location_count": count,
+                    "channel": line_channel,
                 }
             )
 
-    return rows
+    return rows, excluded
 
 
 # --------------------------------------------------------------------------- #
@@ -997,8 +1081,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Canceled shipments extract from Kibo.")
     parser.add_argument("--from", dest="date_from", type=parse_cli_date, default=None,
                         help="Window start, inclusive. YYYY-MM-DD or ISO timestamp, UTC.")
-    parser.add_argument("--to", dest="date_to", type=parse_cli_date, default=None,
-                        help="Window end, inclusive. YYYY-MM-DD or ISO timestamp, UTC. Defaults to now.")
+    parser.add_argument("--to", dest="date_to", type=parse_cli_end_date, default=None,
+                        help="Window end, inclusive. A bare YYYY-MM-DD means the end of that "
+                             "day (23:59:59 UTC); a full ISO timestamp is used as written. "
+                             "Defaults to now.")
     parser.add_argument("--hours", type=int, default=None,
                         help=f"Look back this many hours from now. Default {LOOKBACK_HOURS}. "
                              "Ignored when --from is given.")
@@ -1072,18 +1158,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     records: List[Dict[str, Any]] = []
     per_site: List[Tuple[int, int, int, int]] = []
 
+    excluded_total = 0
     for site_id, shipments in per_site_shipments:
-        rows = extract_rows(site_id, shipments, history)
+        rows, excluded = extract_rows(site_id, shipments, history)
+        excluded_total += excluded
         full = sum(1 for r in rows if r["cancellation_type"] == "FULL")
         per_site.append((site_id, len(shipments), full, len(rows) - full))
         log.info(
-            "  site %s -> %s shipment(s) scanned, %s full + %s partial row(s)",
+            "  site %s -> %s shipment(s) scanned, %s full + %s partial row(s)%s",
             site_id,
             len(shipments),
             full,
             len(rows) - full,
+            f", {excluded} excluded by channel" if excluded else "",
         )
         records.extend(rows)
+
+    if EXCLUDED_CHANNELS:
+        log.info(
+            "Excluded channel(s): %s -- %s row(s) dropped",
+            ", ".join(sorted(EXCLUDED_CHANNELS)),
+            excluded_total,
+        )
 
     log.info("Summary (site: shipments scanned / full rows / partial rows)")
     for site_id, scanned, full, partial in per_site:
