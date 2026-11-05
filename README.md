@@ -25,7 +25,7 @@ The workbook goes out as **DJ daily cancellation report** to:
 - giulia.piroli@ladoublej.com
 - beatrice.cabrini@ladoublej.com
 
-The list lives at the top of `scripts/send_report_email.py`; a repository
+The list lives at the top of `send_report_email.py`; a repository
 variable `EMAIL_RECIPIENTS` (comma separated) overrides it without a code
 change. The same file is also attached to the run as an artifact for 90 days,
 so a failed send never loses the data.
@@ -35,7 +35,7 @@ and a body saying so.
 
 ## Setup
 
-1. Copy `scripts/`, `requirements.txt` and `.github/workflows/` into the repo.
+1. The two scripts sit at the repository root, beside `requirements.txt`.
 2. Add a repository secret named `KIBO_API_CREDS` under
    *Settings → Secrets and variables → Actions*:
 
@@ -97,18 +97,18 @@ pip install -r requirements.txt
 
 # last 24 hours, credentials from the environment
 export KIBO_API_CREDS='{"client_id":"...","client_secret":"..."}'
-python scripts/kibo_cancellation_report.py
+python kibo_cancellation_report.py
 
 # or from a file, over a chosen window
-python scripts/kibo_cancellation_report.py \
+python kibo_cancellation_report.py \
     --credentials-file ~/kibo_credentials.json \
     --from 2026-09-01 --to 2026-10-14
 
 # email it, logging instead of sending
-EMAIL_DRY_RUN=true python scripts/send_report_email.py --file output/<name>.xlsx
+EMAIL_DRY_RUN=true python send_report_email.py --file output/<name>.xlsx
 
 # send to yourself only
-python scripts/send_report_email.py --file output/<name>.xlsx --to you@thelevelgroup.com
+python send_report_email.py --file output/<name>.xlsx --to you@thelevelgroup.com
 ```
 
 ## Tuning
