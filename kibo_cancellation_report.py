@@ -137,6 +137,14 @@ LOOKBACK_HOURS = _env_int("LOOKBACK_HOURS", 24)
 # shipment canceled yesterday is often touched again afterwards, which pushes
 # its updateDate past the window, so the padding is what keeps it visible.
 UPDATE_WINDOW_PADDING_DAYS = _env_int("UPDATE_WINDOW_PADDING_DAYS", 7)
+# Backwards padding is nearly pointless: an update cannot predate the
+# cancellation it records. One day covers clock skew.
+UPDATE_WINDOW_PADDING_BACK_DAYS = _env_int("UPDATE_WINDOW_PADDING_BACK_DAYS", 1)
+# Carry the queried window's end up to now, so a cancellation inside the window
+# is still found when its shipment was touched again long afterwards. Free for
+# the daily run; it is what makes an old backfill complete. Set false to cap the
+# end at UPDATE_WINDOW_PADDING_DAYS and keep a far-past backfill short.
+PAD_FORWARD_TO_NOW = _env_bool("PAD_FORWARD_TO_NOW", True)
 
 # Discard rows whose own cancellation_date falls outside the requested window.
 FILTER_ROWS_BY_CANCELLATION_DATE = True
@@ -326,8 +334,24 @@ def build_filter(start: datetime, end: datetime) -> str:
 
 
 def padded_window(start: datetime, end: datetime) -> Tuple[datetime, datetime]:
-    padding = timedelta(days=UPDATE_WINDOW_PADDING_DAYS)
-    return start - padding, end + padding
+    """
+    The window actually asked of Kibo, which can only filter on the shipment's
+    last update.
+
+    The padding is asymmetric on purpose. A shipment's updateDate can never be
+    *earlier* than the cancellation it records, so padding backwards buys
+    almost nothing and only costs query time; one day absorbs clock skew.
+    Forwards is the direction that matters: a shipment canceled inside the
+    window and touched again afterwards carries an updateDate past the window
+    end, and a fixed few days of padding silently loses it. The end is
+    therefore carried to now, which is free for the daily run (its window
+    already ends now) and is what makes a historical backfill complete.
+    """
+    back = timedelta(days=UPDATE_WINDOW_PADDING_BACK_DAYS)
+    forward_end = end + timedelta(days=UPDATE_WINDOW_PADDING_DAYS)
+    if PAD_FORWARD_TO_NOW:
+        forward_end = max(forward_end, datetime.now(timezone.utc))
+    return start - back, forward_end
 
 
 def window_slices(start: datetime, end: datetime) -> List[Tuple[datetime, datetime]]:
@@ -1088,6 +1112,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--hours", type=int, default=None,
                         help=f"Look back this many hours from now. Default {LOOKBACK_HOURS}. "
                              "Ignored when --from is given.")
+    parser.add_argument("--trace-order", default=None, metavar="ORDER_NUMBER",
+                        help="Explain why one order (externalOrderId, e.g. DJ-EU-00361631) is "
+                             "or is not in the report for the given window, then exit.")
     parser.add_argument("--credentials-file", type=Path, default=None,
                         help=f"Read the credentials JSON from this file instead of "
                              f"the {KIBO_CREDENTIALS_ENV} environment variable.")
@@ -1106,6 +1133,84 @@ def index_shipments(
         number = shipment.get("shipmentNumber")
         if order_id and number is not None:
             index.setdefault((site_id, str(order_id)), {})[number] = shipment
+
+
+def trace_order(kibo: "KiboClient", order_id: str, start: datetime, end: datetime) -> int:
+    """
+    Explain, shipment by shipment, why one order is or is not in the report.
+
+    Looks the order up directly, bypassing the date-windowed walk, then checks
+    it against every stage a row has to survive: fetched by the server-side
+    updateDate filter, qualifies as a cancellation, channel not excluded,
+    cancellation date inside the requested window.
+    """
+    padded_start, padded_end = padded_window(start, end)
+    log.info("Tracing order %s", order_id)
+    log.info("  requested window : %s -> %s", _kibo_timestamp(start), _kibo_timestamp(end))
+    log.info("  queried window   : %s -> %s", _kibo_timestamp(padded_start), _kibo_timestamp(padded_end))
+
+    found_any = False
+    reported = 0
+
+    for site_id in SITE_IDS:
+        shipments = kibo.shipments_of_order(site_id, order_id)
+        if not shipments:
+            continue
+        found_any = True
+        log.info("  site %s: %s shipment(s)", site_id, len(shipments))
+
+        for shipment in sorted(shipments, key=shipment_sort_key):
+            number = shipment.get("shipmentNumber")
+            status = str(shipment.get("shipmentStatus", "")).upper()
+            updated = _parse_timestamp((shipment.get("auditInfo") or {}).get("updateDate"))
+            canceled_items = shipment.get("canceledItems") or []
+            full = status == "CANCELED"
+
+            log.info("    shipment %s [%s] updateDate=%s canceledItems=%s",
+                     number, status,
+                     _kibo_timestamp(updated) if updated else "none",
+                     len(canceled_items))
+
+            if updated and not (padded_start <= updated <= padded_end):
+                log.info("      EXCLUDED: the walk never sees it -- its updateDate is outside "
+                         "the queried window. Widen the window or the padding.")
+                continue
+            if not full and not canceled_items:
+                log.info("      not a cancellation: status is not CANCELED and nothing was canceled")
+                continue
+
+            channel = shipment_channel(shipment)
+            rows = canceled_items or [None]
+            for item in rows:
+                code = (item or {}).get("productCode") if item else None
+                line_channel = ((item or {}).get("data") or {}).get(CHANNEL_FIELD) or channel
+                when = _parse_timestamp(
+                    ((item or {}).get("auditInfo") or (shipment.get("auditInfo") or {})).get("updateDate")
+                )
+                label = f"      product {code or '(none)'}"
+
+                if is_excluded_channel(line_channel):
+                    log.info("%s EXCLUDED: channel %r is in EXCLUDE_CHANNELS", label, line_channel)
+                    continue
+                if when is None:
+                    log.info("%s INCLUDED: no cancellation date, kept", label)
+                    reported += 1
+                    continue
+                if not (start <= when <= end):
+                    log.info("%s EXCLUDED: cancellation_date %s is outside the requested "
+                             "window", label, _kibo_timestamp(when))
+                    continue
+                log.info("%s INCLUDED: cancellation_date=%s channel=%r",
+                         label, _kibo_timestamp(when), line_channel)
+                reported += 1
+
+    if not found_any:
+        log.warning("  order %s was not found on any configured site. Check the order "
+                    "number and that its site is in SITE_IDS.", order_id)
+        return 1
+
+    log.info("  verdict: %s row(s) would appear in the report for this order", reported)
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1134,6 +1239,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         TENANT_ID,
         build_filter(padded_start, padded_end),
     )
+    if args.trace_order:
+        return trace_order(kibo, args.trace_order, start, end)
+
     log.info(
         "Scanning %s to %s in %s slice(s) of %s day(s), sorted by %s",
         _kibo_timestamp(padded_start),
