@@ -94,7 +94,7 @@ jobs:
           SMTP_AUTH_MECHANISM: ${{ vars.SMTP_AUTH_MECHANISM }}
           SMTP_REMOVE_PASSWORD_SPACES: ${{ vars.SMTP_REMOVE_PASSWORD_SPACES }}
           EMAIL_FROM: ${{ vars.EMAIL_FROM }}
-        run: python scripts/send_report_email.py --login-test
+        run: python send_report_email.py --login-test
 
       - name: Build the cancellation report
         id: report
@@ -116,7 +116,7 @@ jobs:
           if [ -n "${INPUT_FROM:-}" ];  then args+=(--from "$INPUT_FROM");   fi
           if [ -n "${INPUT_TO:-}" ];    then args+=(--to "$INPUT_TO");       fi
           if [ -n "${INPUT_HOURS:-}" ]; then args+=(--hours "$INPUT_HOURS"); fi
-          python scripts/kibo_cancellation_report.py ${args[@]+"${args[@]}"}
+          python kibo_cancellation_report.py ${args[@]+"${args[@]}"}
 
       - name: Upload the Excel file
         if: steps.guard.outputs.skip != 'true' && env.MODE != 'smtp-login-test'
@@ -140,14 +140,14 @@ jobs:
           SMTP_REMOVE_PASSWORD_SPACES: ${{ vars.SMTP_REMOVE_PASSWORD_SPACES }}
           EMAIL_FROM: ${{ vars.EMAIL_FROM }}
           # Repository variable EMAIL_RECIPIENTS overrides the list baked into
-          # scripts/send_report_email.py. Leave it unset to use the DJ team.
+          # send_report_email.py. Leave it unset to use the DJ team.
           EMAIL_RECIPIENTS: ${{ vars.EMAIL_RECIPIENTS }}
           EMAIL_DRY_RUN: ${{ inputs.dry_run || vars.EMAIL_DRY_RUN }}
           REPORT_PATH: ${{ steps.report.outputs.report_path }}
           WINDOW_START: ${{ steps.report.outputs.window_start }}
           WINDOW_END: ${{ steps.report.outputs.window_end }}
         run: |
-          python scripts/send_report_email.py \
+          python send_report_email.py \
             --file "$REPORT_PATH" \
             --subject "DJ daily cancellation report" \
             --window-start "$WINDOW_START" \
