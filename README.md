@@ -123,6 +123,20 @@ EMAIL_DRY_RUN=true python send_report_email.py --file output/<name>.xlsx
 python send_report_email.py --file output/<name>.xlsx --to you@thelevelgroup.com
 ```
 
+## Why is an order missing?
+
+Run the report with `--trace-order` and it will say, stage by stage, what
+happened to every shipment of that order:
+
+```bash
+python kibo_cancellation_report.py --from 2026-05-20 --to 2026-05-20 \
+    --trace-order DJ-EU-00361631
+```
+
+Each line ends in `INCLUDED` or `EXCLUDED` with the reason: never fetched
+(its last update falls outside the queried window), not a cancellation,
+channel excluded, or a `cancellation_date` outside the requested window.
+
 ## Tuning
 
 Set these as `env:` on the report step, or shell variables locally.
@@ -130,7 +144,9 @@ Set these as `env:` on the report step, or shell variables locally.
 | Variable | Default | Purpose |
 |---|---|---|
 | `LOOKBACK_HOURS` | `24` | Size of the rolling window |
-| `UPDATE_WINDOW_PADDING_DAYS` | `7` | Days added each side of the window when querying Kibo, because the API filters on last update, which drifts past the cancellation date. Rows are then filtered on their real `cancellation_date`. Lower it to shorten the run, at the risk of missing a late-touched shipment |
+| `UPDATE_WINDOW_PADDING_DAYS` | `7` | Days added after the window end when querying Kibo |
+| `UPDATE_WINDOW_PADDING_BACK_DAYS` | `1` | Days added before the window start. An update cannot predate the cancellation it records, so this only absorbs clock skew |
+| `PAD_FORWARD_TO_NOW` | `true` | Carry the queried end up to now, so a cancellation inside the window is still found when its shipment was touched again weeks later. Free for the daily run; set `false` to keep a far-past backfill short, accepting that late-touched shipments go missing |
 | `CHUNK_DAYS` | `3` | Slice size for paging |
 | `KIBO_TENANT_ID` | `30018` | Tenant |
 | `KIBO_SITE_IDS` | the ten sites | Comma-separated override |
