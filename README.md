@@ -123,6 +123,20 @@ EMAIL_DRY_RUN=true python send_report_email.py --file output/<name>.xlsx
 python send_report_email.py --file output/<name>.xlsx --to you@thelevelgroup.com
 ```
 
+## Paging and slice splitting
+
+Kibo's offset paging is not reliable past the first page or two: deeper
+offsets return an earlier page again instead of new rows. A slice that claims
+267 rows would hand back 200 and stop, and the remaining 67 were silently lost.
+
+The walk now compares what each slice returned against what the server claimed,
+and halves the date range and retries whenever it comes up short, repeatedly,
+until each query is shallow enough to come back whole. Healthy slices cost
+nothing extra. The log shows a split as `got 200 of 267, splitting at ...`.
+`MAX_SLICE_SPLIT_DEPTH` (12) and `MIN_SLICE_SPAN_SECONDS` (2) bound the
+recursion; if a range still can't be read whole, the log says so plainly
+instead of quietly returning fewer rows.
+
 ## Why is an order missing?
 
 Run the report with `--trace-order` and it will say, stage by stage, what
