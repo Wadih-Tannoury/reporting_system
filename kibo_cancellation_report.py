@@ -206,6 +206,10 @@ DEDUPLICATE = True
 # most of the result set is never reachable. Set to None only to test what the
 # unsorted endpoint does.
 SORT_BY: Optional[str] = "shipmentNumber asc"
+# Page by "shipmentNumber gt <last seen>" rather than by startIndex. Offset
+# paging on this API repeats earlier pages past the first page or two, which
+# silently loses rows. Requires SORT_BY to order by the same field.
+KEYSET_PAGING = _env_bool("KEYSET_PAGING", True)
 
 # The window is walked in slices of this many days, so no single query has to
 # be paged very deep. A site with thousands of shipments in the window is the
@@ -574,20 +578,30 @@ class KiboClient:
         """
         One filter, paged to exhaustion.
 
-        Returns the fresh shipments, the total the API claimed, and whether the
-        walk ended early. Pages that overlap one already seen are tolerated
-        rather than fatal: the cursor keeps advancing, and only a run of
-        MAX_EMPTY_PAGES fruitless pages ends the slice.
+        Paging is by shipment number, not by offset. The results are sorted by
+        shipmentNumber ascending, so each page asks for the rows after the
+        highest number already seen. That is immune to the drift that breaks
+        offset paging here, and unlike narrowing the date range it still works
+        when hundreds of shipments carry the identical updateDate, as they do
+        on bulk-update days.
+
+        Returns the fresh shipments, the total the API claimed, whether the
+        walk ended early, and how many distinct rows the slice showed.
         """
         collected: List[dict] = []
         slice_seen: set = set()   # every number this slice returned, new or not
         start_index = 0
+        cursor: Optional[int] = None
         total: Optional[int] = None
         empty_streak = 0
         truncated = False
 
         for _ in range(MAX_PAGES_PER_SITE):
-            payload = self._request_page(site_id, start_index, filter_expression=filter_expression)
+            expression = filter_expression
+            if KEYSET_PAGING and cursor is not None:
+                expression = f"{filter_expression} and shipmentNumber gt {cursor}"
+
+            payload = self._request_page(site_id, start_index, filter_expression=expression)
             if payload is None:
                 truncated = True
                 log.warning("  %s: page at %s failed", label, start_index)
@@ -598,7 +612,11 @@ class KiboClient:
                 break
 
             page_info = payload.get("page") or {}
-            if page_info.get("totalElements") is not None:
+            # Only the uncursored first page counts the whole slice; later
+            # pages report what is left after the cursor.
+            if page_info.get("totalElements") is not None and (
+                total is None or not KEYSET_PAGING
+            ):
                 total = page_info["totalElements"]
 
             fresh = []
@@ -623,6 +641,23 @@ class KiboClient:
 
             if total is not None and len(slice_seen) >= total:
                 break
+
+            if KEYSET_PAGING:
+                numbers = [s.get("shipmentNumber") for s in page]
+                numbers = [n for n in numbers if isinstance(n, int)]
+                if not numbers:
+                    truncated = True
+                    break
+                highest = max(numbers)
+                if cursor is not None and highest <= cursor:
+                    # The cursor would not advance, so the next request would
+                    # return this same page forever.
+                    truncated = True
+                    break
+                cursor = highest
+                if len(page) < API_PAGE_SIZE:
+                    break
+                continue
 
             if total is not None and start_index + len(page) >= total:
                 # The offsets say the result set is exhausted, but fewer rows
