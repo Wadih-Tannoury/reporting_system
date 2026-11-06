@@ -231,6 +231,12 @@ API_MAX_RETRIES = 3
 API_RETRY_BACKOFF = 2.0
 API_PAGE_SIZE = 200
 MAX_PAGES_PER_SITE = 2000  # safety stop; the walk is wider than it used to be
+# A slice that comes back short is halved and retried. Deep offset paging on
+# this API repeats earlier pages instead of returning new rows, so narrowing
+# the date range is the only way to reach the remainder. Depth 12 turns a
+# 3-day slice into roughly one-minute windows.
+MAX_SLICE_SPLIT_DEPTH = _env_int("MAX_SLICE_SPLIT_DEPTH", 12)
+MIN_SLICE_SPAN = timedelta(seconds=_env_int("MIN_SLICE_SPAN_SECONDS", 2))
 ORDER_HISTORY_PAGE_SIZE = 100
 
 logging.basicConfig(
@@ -564,7 +570,7 @@ class KiboClient:
 
     def _page_through(
         self, site_id: int, filter_expression: str, seen_numbers: set, label: str
-    ) -> Tuple[List[dict], Optional[int], bool]:
+    ) -> Tuple[List[dict], Optional[int], bool, int]:
         """
         One filter, paged to exhaustion.
 
@@ -574,6 +580,7 @@ class KiboClient:
         MAX_EMPTY_PAGES fruitless pages ends the slice.
         """
         collected: List[dict] = []
+        slice_seen: set = set()   # every number this slice returned, new or not
         start_index = 0
         total: Optional[int] = None
         empty_streak = 0
@@ -597,7 +604,10 @@ class KiboClient:
             fresh = []
             for shipment in page:
                 number = shipment.get("shipmentNumber")
-                if number is None or number in seen_numbers:
+                if number is None:
+                    continue
+                slice_seen.add(number)
+                if number in seen_numbers:
                     continue
                 seen_numbers.add(number)
                 fresh.append(shipment)
@@ -611,13 +621,26 @@ class KiboClient:
                     truncated = total is not None and len(collected) < total
                     break
 
-            if total is not None and start_index + len(page) >= total:
+            if total is not None and len(slice_seen) >= total:
                 break
+
+            if total is not None and start_index + len(page) >= total:
+                # The offsets say the result set is exhausted, but fewer rows
+                # than the server claimed actually arrived: a later page
+                # repeated an earlier one. Walking further only repeats it
+                # again, so stop and report the shortfall rather than exiting
+                # as if the slice were complete.
+                truncated = True
+                break
+
             start_index += len(page)
         else:
             truncated = True
 
-        return collected, total, truncated
+        if total is not None and len(slice_seen) < total:
+            truncated = True
+
+        return collected, total, truncated, len(slice_seen)
 
     def iter_shipments(self, site_id: int, slices: Sequence[Tuple[datetime, datetime]]) -> List[dict]:
         """
@@ -632,25 +655,73 @@ class KiboClient:
         claimed = 0
         incomplete = False
 
-        for index, (slice_start, slice_end) in enumerate(slices, start=1):
-            label = f"site {site_id} [{index}/{len(slices)}] {slice_start:%Y-%m-%d}"
+        def walk(
+            slice_start: datetime,
+            slice_end: datetime,
+            label: str,
+            depth: int = 0,
+        ) -> Tuple[int, bool]:
+            """
+            One slice, split in half and retried whenever the server returns
+            fewer rows than it claims. Deep offset paging on this API stops
+            yielding new rows past a couple of pages, so the only reliable way
+            to reach the rest is to narrow the date range until each query is
+            shallow enough to come back whole.
+            """
             expression = build_filter(slice_start, slice_end)
-            collected, total, truncated = self._page_through(
+            collected, total, truncated, observed = self._page_through(
                 site_id, expression, seen_numbers, label
             )
             shipments.extend(collected)
-            if total:
-                claimed += total
-            if truncated:
+            got = observed
+
+            short = truncated or (total is not None and observed < total)
+            if not short:
+                return (total or 0), False
+
+            span = slice_end - slice_start
+            if depth >= MAX_SLICE_SPLIT_DEPTH or span <= MIN_SLICE_SPAN:
+                log.warning(
+                    "  %s: %s of %s row(s) unreachable, slice cannot be split further",
+                    label,
+                    (total - got) if total is not None else "some",
+                    total,
+                )
+                return (total or 0), True
+
+            midpoint = slice_start + span / 2
+            log.info(
+                "  %s: got %s of %s, splitting at %s",
+                label,
+                got,
+                total if total is not None else "?",
+                _kibo_timestamp(midpoint),
+            )
+            left_total, left_bad = walk(
+                slice_start, midpoint, f"{label} <{depth + 1}a>", depth + 1
+            )
+            right_total, right_bad = walk(
+                midpoint + timedelta(seconds=1),
+                slice_end,
+                f"{label} <{depth + 1}b>",
+                depth + 1,
+            )
+            return left_total + right_total, (left_bad or right_bad)
+
+        for index, (slice_start, slice_end) in enumerate(slices, start=1):
+            label = f"site {site_id} [{index}/{len(slices)}] {slice_start:%Y-%m-%d}"
+            before = len(shipments)
+            slice_claimed, bad = walk(slice_start, slice_end, label)
+            claimed += slice_claimed
+            if bad:
                 incomplete = True
-                log.warning("  %s: slice ended early", label)
 
             log.info(
-                "  %s: +%s shipment(s) (site total %s%s)",
+                "  %s: +%s shipment(s) (site total %s, slice claimed %s)",
                 label,
-                len(collected),
+                len(shipments) - before,
                 len(shipments),
-                f", slice claimed {total}" if total is not None else "",
+                slice_claimed,
             )
 
         # claimed counts duplicates across slices, so it is an upper bound only.
