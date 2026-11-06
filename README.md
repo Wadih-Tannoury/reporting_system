@@ -123,19 +123,25 @@ EMAIL_DRY_RUN=true python send_report_email.py --file output/<name>.xlsx
 python send_report_email.py --file output/<name>.xlsx --to you@thelevelgroup.com
 ```
 
-## Paging and slice splitting
+## Paging
 
-Kibo's offset paging is not reliable past the first page or two: deeper
-offsets return an earlier page again instead of new rows. A slice that claims
-267 rows would hand back 200 and stop, and the remaining 67 were silently lost.
+Kibo's offset paging is not reliable here: past the first page or two, a
+deeper `startIndex` returns an earlier page again instead of new rows. A slice
+claiming 267 rows handed back 200 and stopped, and the other 67 were lost
+silently.
 
-The walk now compares what each slice returned against what the server claimed,
-and halves the date range and retries whenever it comes up short, repeatedly,
-until each query is shallow enough to come back whole. Healthy slices cost
-nothing extra. The log shows a split as `got 200 of 267, splitting at ...`.
-`MAX_SLICE_SPLIT_DEPTH` (12) and `MIN_SLICE_SPAN_SECONDS` (2) bound the
-recursion; if a range still can't be read whole, the log says so plainly
-instead of quietly returning fewer rows.
+Paging is therefore by **shipment number**, not by offset. Results are sorted
+by `shipmentNumber asc`, and each page asks for rows after the highest number
+already seen (`shipmentNumber gt N`). The cursor cannot repeat itself, so the
+walk reaches the end of a slice however large it is, in fewer calls than
+offset paging took to fail. Set `KEYSET_PAGING=false` to go back to offsets.
+
+Slice splitting remains as a safety net: if a slice still returns fewer rows
+than the server claims, the date range is halved and retried, bounded by
+`MAX_SLICE_SPLIT_DEPTH` (12) and `MIN_SLICE_SPAN_SECONDS` (2). With keyset
+paging it should rarely trigger. Splitting alone could not fix bulk-update
+days, where hundreds of shipments share one `updateDate` and no date range is
+narrow enough to separate them; keyset paging handles those.
 
 ## Why is an order missing?
 
