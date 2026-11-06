@@ -210,6 +210,9 @@ SORT_BY: Optional[str] = "shipmentNumber asc"
 # paging on this API repeats earlier pages past the first page or two, which
 # silently loses rows. Requires SORT_BY to order by the same field.
 KEYSET_PAGING = _env_bool("KEYSET_PAGING", True)
+# Kibo's filter parser is RSQL and wants symbolic comparisons, the same ones
+# the date clauses use. The word forms ("gt") are rejected with HTTP 400.
+KEYSET_OP = os.environ.get("KEYSET_OP", ">").strip() or ">"
 
 # The window is walked in slices of this many days, so no single query has to
 # be paged very deep. A site with thousands of shipments in the window is the
@@ -458,6 +461,8 @@ class KiboClient:
         self.host = credentials["host"]
         self.tenant_id = tenant_id
         self.filter_expression = filter_expression
+        # None until the cursor clause has been tried; False if rejected.
+        self.keyset_ok: Optional[bool] = None
         self.session = requests.Session()
         self._access_token: Optional[str] = None
         self._token_expires_at: float = 0.0
@@ -588,6 +593,7 @@ class KiboClient:
         Returns the fresh shipments, the total the API claimed, whether the
         walk ended early, and how many distinct rows the slice showed.
         """
+        use_keyset = KEYSET_PAGING and self.keyset_ok is not False
         collected: List[dict] = []
         slice_seen: set = set()   # every number this slice returned, new or not
         start_index = 0
@@ -598,11 +604,22 @@ class KiboClient:
 
         for _ in range(MAX_PAGES_PER_SITE):
             expression = filter_expression
-            if KEYSET_PAGING and cursor is not None:
-                expression = f"{filter_expression} and shipmentNumber gt {cursor}"
+            if use_keyset and cursor is not None:
+                expression = f"{filter_expression} and shipmentNumber {KEYSET_OP} {cursor}"
 
             payload = self._request_page(site_id, start_index, filter_expression=expression)
             if payload is None:
+                if use_keyset and cursor is not None and self.keyset_ok is not False:
+                    # The cursor clause itself is being rejected. Disable it for
+                    # the rest of the run and redo this slice with offsets,
+                    # rather than failing every page from here on.
+                    self.keyset_ok = False
+                    log.warning(
+                        "  %s: the server rejected the '%s' cursor clause; "
+                        "falling back to offset paging for the whole run",
+                        label, KEYSET_OP,
+                    )
+                    return self._page_through(site_id, filter_expression, seen_numbers, label)
                 truncated = True
                 log.warning("  %s: page at %s failed", label, start_index)
                 break
@@ -615,7 +632,7 @@ class KiboClient:
             # Only the uncursored first page counts the whole slice; later
             # pages report what is left after the cursor.
             if page_info.get("totalElements") is not None and (
-                total is None or not KEYSET_PAGING
+                total is None or not use_keyset
             ):
                 total = page_info["totalElements"]
 
@@ -642,7 +659,7 @@ class KiboClient:
             if total is not None and len(slice_seen) >= total:
                 break
 
-            if KEYSET_PAGING:
+            if use_keyset:
                 numbers = [s.get("shipmentNumber") for s in page]
                 numbers = [n for n in numbers if isinstance(n, int)]
                 if not numbers:
