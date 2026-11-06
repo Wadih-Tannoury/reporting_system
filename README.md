@@ -132,9 +132,13 @@ silently.
 
 Paging is therefore by **shipment number**, not by offset. Results are sorted
 by `shipmentNumber asc`, and each page asks for rows after the highest number
-already seen (`shipmentNumber gt N`). The cursor cannot repeat itself, so the
+already seen (`shipmentNumber > N`). Kibo's filter parser is RSQL and wants
+the symbolic comparisons the date clauses already use; the word forms (`gt`)
+come back as HTTP 400. The cursor cannot repeat itself, so the
 walk reaches the end of a slice however large it is, in fewer calls than
-offset paging took to fail. Set `KEYSET_PAGING=false` to go back to offsets.
+offset paging took to fail. If the server ever rejects the cursor clause, the
+run says so once and falls back to offset paging rather than failing every
+page. `KEYSET_PAGING=false` forces offsets; `KEYSET_OP` changes the operator.
 
 Slice splitting remains as a safety net: if a slice still returns fewer rows
 than the server claims, the date range is halved and retried, bounded by
