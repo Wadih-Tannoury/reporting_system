@@ -242,13 +242,8 @@ MAX_PAGES_PER_SITE = 2000  # safety stop; the walk is wider than it used to be
 # this API repeats earlier pages instead of returning new rows, so narrowing
 # the date range is the only way to reach the remainder. Depth 12 turns a
 # 3-day slice into roughly one-minute windows.
-MAX_SLICE_SPLIT_DEPTH = _env_int("MAX_SLICE_SPLIT_DEPTH", 48)
+MAX_SLICE_SPLIT_DEPTH = _env_int("MAX_SLICE_SPLIT_DEPTH", 12)
 MIN_SLICE_SPAN = timedelta(seconds=_env_int("MIN_SLICE_SPAN_SECONDS", 2))
-# Bounds for the shipment-number bisection. The ceiling only has to exceed any
-# real shipment number; the search narrows to the populated range in a few
-# steps and costs nothing when a slice comes back whole.
-NUMBER_RANGE_FLOOR = _env_int("NUMBER_RANGE_FLOOR", 0)
-NUMBER_RANGE_CEILING = _env_int("NUMBER_RANGE_CEILING", 2_000_000_000)
 ORDER_HISTORY_PAGE_SIZE = 100
 
 logging.basicConfig(
@@ -624,18 +619,7 @@ class KiboClient:
                         "falling back to offset paging for the whole run",
                         label, KEYSET_OP,
                     )
-                    # Rows already gathered in this attempt are in
-                    # seen_numbers, so the retry cannot pick them up again.
-                    # Carry them over rather than losing them.
-                    again, again_total, again_trunc, again_seen = self._page_through(
-                        site_id, filter_expression, seen_numbers, label
-                    )
-                    return (
-                        collected + again,
-                        again_total if again_total is not None else total,
-                        again_trunc,
-                        max(len(slice_seen), again_seen),
-                    )
+                    return self._page_through(site_id, filter_expression, seen_numbers, label)
                 truncated = True
                 log.warning("  %s: page at %s failed", label, start_index)
                 break
@@ -727,69 +711,52 @@ class KiboClient:
             slice_start: datetime,
             slice_end: datetime,
             label: str,
-            lo: Optional[int] = None,
-            hi: Optional[int] = None,
             depth: int = 0,
         ) -> Tuple[int, bool]:
             """
-            One slice, narrowed by shipment-number range whenever the server
-            returns fewer rows than it claims.
-
-            Splitting on the number rather than on the date is what makes this
-            sound. A date range cannot separate rows that share an updateDate,
-            and a keyset cursor only works if the server really does sort by
-            the cursor field. Shipment numbers are distinct integers, so
-            halving the number range always partitions the set exactly, no
-            matter what order the server returns rows in or how many share a
-            timestamp.
+            One slice, split in half and retried whenever the server returns
+            fewer rows than it claims. Deep offset paging on this API stops
+            yielding new rows past a couple of pages, so the only reliable way
+            to reach the rest is to narrow the date range until each query is
+            shallow enough to come back whole.
             """
             expression = build_filter(slice_start, slice_end)
-            if lo is not None:
-                expression += f" and shipmentNumber {KEYSET_OP} {lo}"
-            if hi is not None:
-                expression += f" and shipmentNumber <= {hi}"
-
             collected, total, truncated, observed = self._page_through(
                 site_id, expression, seen_numbers, label
             )
             shipments.extend(collected)
+            got = observed
 
             short = truncated or (total is not None and observed < total)
             if not short:
                 return (total or 0), False
 
-            if total is None:
-                # The request itself failed, so the server told us nothing
-                # about how many rows there are. Narrowing the number range
-                # would just repeat the same failure on both halves.
+            span = slice_end - slice_start
+            if depth >= MAX_SLICE_SPLIT_DEPTH or span <= MIN_SLICE_SPAN:
                 log.warning(
-                    "  %s: the query failed outright; not splitting, since a "
-                    "narrower range would fail the same way",
+                    "  %s: %s of %s row(s) unreachable, slice cannot be split further",
                     label,
-                )
-                return 0, True
-
-            lo_eff = NUMBER_RANGE_FLOOR if lo is None else lo
-            hi_eff = NUMBER_RANGE_CEILING if hi is None else hi
-            if depth >= MAX_SLICE_SPLIT_DEPTH or hi_eff - lo_eff <= 1:
-                log.warning(
-                    "  %s: %s of %s row(s) unreachable, range cannot be split further",
-                    label,
-                    (total - observed) if total is not None else "some",
+                    (total - got) if total is not None else "some",
                     total,
                 )
                 return (total or 0), True
 
-            midpoint = (lo_eff + hi_eff) // 2
+            midpoint = slice_start + span / 2
             log.info(
-                "  %s: got %s of %s, splitting shipmentNumber at %s",
-                label, observed, total if total is not None else "?", midpoint,
+                "  %s: got %s of %s, splitting at %s",
+                label,
+                got,
+                total if total is not None else "?",
+                _kibo_timestamp(midpoint),
             )
             left_total, left_bad = walk(
-                slice_start, slice_end, f"{label} <{depth + 1}a>", lo_eff, midpoint, depth + 1
+                slice_start, midpoint, f"{label} <{depth + 1}a>", depth + 1
             )
             right_total, right_bad = walk(
-                slice_start, slice_end, f"{label} <{depth + 1}b>", midpoint, hi_eff, depth + 1
+                midpoint + timedelta(seconds=1),
+                slice_end,
+                f"{label} <{depth + 1}b>",
+                depth + 1,
             )
             return left_total + right_total, (left_bad or right_bad)
 
