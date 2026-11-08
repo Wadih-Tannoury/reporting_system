@@ -140,14 +140,12 @@ offset paging took to fail. If the server ever rejects the cursor clause, the
 run says so once and falls back to offset paging rather than failing every
 page. `KEYSET_PAGING=false` forces offsets; `KEYSET_OP` changes the operator.
 
-If a slice still comes back short, the fallback narrows by **shipment number**,
-not by date: `shipmentNumber > A and shipmentNumber <= B`, halved until each
-query returns whole. Numbers are distinct integers, so this partitions the set
-exactly however the server orders its rows and however many share a timestamp
-— neither of which is true of narrowing the date range. `MAX_SLICE_SPLIT_DEPTH`
-(48) bounds it; empty sub-ranges return at once, so the cost follows the
-populated region rather than the span. A query that fails outright is reported
-and not split, since both halves would fail the same way.
+Slice splitting remains as a safety net: if a slice still returns fewer rows
+than the server claims, the date range is halved and retried, bounded by
+`MAX_SLICE_SPLIT_DEPTH` (12) and `MIN_SLICE_SPAN_SECONDS` (2). With keyset
+paging it should rarely trigger. Splitting alone could not fix bulk-update
+days, where hundreds of shipments share one `updateDate` and no date range is
+narrow enough to separate them; keyset paging handles those.
 
 ## Why is an order missing?
 
