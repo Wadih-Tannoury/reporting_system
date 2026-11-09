@@ -149,6 +149,11 @@ PAD_FORWARD_TO_NOW = _env_bool("PAD_FORWARD_TO_NOW", True)
 # Discard rows whose own cancellation_date falls outside the requested window.
 FILTER_ROWS_BY_CANCELLATION_DATE = True
 
+# A row whose cancellation_date cannot be parsed is dropped with them: the
+# queried window is wider than the requested one, so an unreadable date is more
+# likely an older cancellation than a recent one. Set true to keep such rows.
+KEEP_UNDATED_ROWS = _env_bool("KEEP_UNDATED_ROWS", False)
+
 DATE_FILTER_FIELD: Optional[str] = "auditInfo.updateDate"  # None -> no date filter
 
 # Kibo parses the filter with RSQL/FIQL, which accepts the symbolic operators
@@ -1175,13 +1180,26 @@ def _prepare(records: List[Dict[str, Any]], start: datetime, end: datetime) -> p
 
     if FILTER_ROWS_BY_CANCELLATION_DATE and not frame.empty:
         dates = pd.to_datetime(frame["cancellation_date"], errors="coerce")
-        window = dates.isna() | (
+        inside = (
             (dates >= pd.Timestamp(_as_utc(start).replace(tzinfo=None)))
             & (dates <= pd.Timestamp(_as_utc(end).replace(tzinfo=None)))
         )
+        # A row whose cancellation_date cannot be read cannot be shown to fall
+        # inside the window. Kibo is queried over a window widened by up to
+        # UPDATE_WINDOW_PADDING_DAYS, so keeping those rows let older
+        # cancellations into the report. They are dropped by default; set
+        # KEEP_UNDATED_ROWS=true to keep them and inspect them by hand.
+        undated = dates.isna()
+        window = inside | undated if KEEP_UNDATED_ROWS else inside
+
         dropped = int((~window).sum())
         if dropped:
             log.info("Dropped %s row(s) canceled outside the requested window", dropped)
+        if not KEEP_UNDATED_ROWS and int(undated.sum()):
+            log.info(
+                "Of those, %s row(s) had no readable cancellation_date",
+                int(undated.sum()),
+            )
         frame = frame[window]
 
     if DEDUPLICATE:
@@ -1420,6 +1438,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if not records and not ALWAYS_WRITE_FILE:
         log.warning("No cancellations found in the window; nothing to write.")
+        # Still hand the window and the zero back to the workflow, so the email
+        # step can report the quiet day instead of failing on a missing path.
+        _publish_outputs(None, 0, start, end)
         return 0
     if not records:
         log.warning("No cancellations found in the window; writing an empty workbook.")
@@ -1430,14 +1451,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
-def _publish_outputs(path: Path, rows: int, start: datetime, end: datetime) -> None:
+def _publish_outputs(path: Optional[Path], rows: int, start: datetime, end: datetime) -> None:
     """Hand the result back to the workflow through $GITHUB_OUTPUT."""
     target = os.environ.get("GITHUB_OUTPUT")
     if not target:
         return
     with open(target, "a", encoding="utf-8") as handle:
-        handle.write(f"report_path={path}\n")
-        handle.write(f"report_name={path.name}\n")
+        handle.write(f"report_path={path or ''}\n")
+        handle.write(f"report_name={path.name if path else ''}\n")
         handle.write(f"row_count={rows}\n")
         handle.write(f"window_start={_kibo_timestamp(start)}\n")
         handle.write(f"window_end={_kibo_timestamp(end)}\n")
