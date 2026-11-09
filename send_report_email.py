@@ -26,6 +26,7 @@ import smtplib
 import ssl
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Sequence
 
@@ -245,7 +246,54 @@ def sheet_counts(path: Path) -> Optional[dict]:
         return None
 
 
-def build_body(path: Path, window_start: str, window_end: str) -> str:
+def window_hours(window_start: str, window_end: str) -> Optional[float]:
+    """Length of the reported window in hours, or None if it cannot be read."""
+    if not window_start or not window_end:
+        return None
+    try:
+        start = datetime.fromisoformat(window_start.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(window_end.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (end - start).total_seconds() / 3600
+
+
+def count_rows(path: Optional[Path], row_count: Optional[int]) -> Optional[int]:
+    """
+    How many canceled items the report holds.
+
+    The workflow passes the count the report step produced; falling back to the
+    workbook keeps a manual run honest.
+    """
+    if row_count is not None and row_count >= 0:
+        return row_count
+    if path is None or not path.exists():
+        return None
+    counts = sheet_counts(path)
+    if counts is None:
+        return None
+    return counts.get("cancellations", 0)
+
+
+def build_empty_body(window_start: str, window_end: str) -> str:
+    """The whole message on a day with nothing to report."""
+    hours = window_hours(window_start, window_end)
+    if hours is None or 23 <= hours <= 25:
+        return "No DJ shipments were cancelled in the last 24 hours\n"
+    if window_start and window_end:
+        return (
+            "No DJ shipments were cancelled between "
+            f"{window_start} and {window_end} (UTC)\n"
+        )
+    return "No DJ shipments were cancelled in the reported window\n"
+
+
+def build_body(
+    path: Path,
+    window_start: str,
+    window_end: str,
+    row_count: Optional[int] = None,
+) -> str:
     counts = sheet_counts(path)
     lines = ["Daily cancellation report for tenant 30018, attached as an Excel file.", ""]
 
@@ -254,13 +302,12 @@ def build_body(path: Path, window_start: str, window_end: str) -> str:
 
     if counts is not None:
         total = counts.get("cancellations", 0)
-        if total:
-            lines.append(
-                f"Canceled items: {total} "
-                f"({counts.get('full', 0)} full, {counts.get('partial', 0)} partial)"
-            )
-        else:
-            lines.append("No cancellations in this window. The workbook is empty.")
+        lines.append(
+            f"Canceled items: {total} "
+            f"({counts.get('full', 0)} full, {counts.get('partial', 0)} partial)"
+        )
+    elif row_count is not None and row_count >= 0:
+        lines.append(f"Canceled items: {row_count}")
 
     lines += [
         "",
@@ -272,19 +319,69 @@ def build_body(path: Path, window_start: str, window_end: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def send_empty_notice(
+    settings: Settings,
+    recipients: Sequence[str],
+    subject: str,
+    window_start: str,
+    window_end: str,
+) -> None:
+    """The quiet-day email: one line, no attachment."""
+    from email.message import EmailMessage
+
+    body = build_empty_body(window_start, window_end)
+
+    msg = EmailMessage()
+    msg["From"] = settings.smtp_from_email
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    if settings.dry_run:
+        log.info(
+            "DRY_RUN=true: would send subject=%r from=%s to=%s with no attachment, body=%r",
+            subject,
+            settings.smtp_from_email,
+            list(recipients),
+            body.strip(),
+        )
+        return
+
+    with open_smtp_session(settings) as smtp:
+        smtp.send_message(msg)
+
+    log.info(
+        "Sent %r from %s to %s with no attachment (no cancellations in the window)",
+        subject,
+        settings.smtp_from_email,
+        ", ".join(recipients),
+    )
+
+
 def send_report(
     settings: Settings,
     recipients: Sequence[str],
     subject: str,
-    path: Path,
+    path: Optional[Path],
     window_start: str,
     window_end: str,
+    row_count: Optional[int] = None,
 ) -> None:
     from email.message import EmailMessage
 
     validate_smtp_settings(settings)
     if not recipients:
         raise RuntimeError("Cannot send the report with an empty recipient list")
+
+    rows = count_rows(path, row_count)
+    # Nothing to report: the mail goes out all the same, saying so, with no
+    # empty workbook attached.
+    if rows == 0:
+        send_empty_notice(settings, recipients, subject, window_start, window_end)
+        return
+
+    if path is None:
+        raise RuntimeError("--file is required when the report holds rows")
     if not path.exists():
         raise RuntimeError(f"Attachment not found: {path}")
 
@@ -296,7 +393,7 @@ def send_report(
     msg["From"] = settings.smtp_from_email
     msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
-    msg.set_content(build_body(path, window_start, window_end))
+    msg.set_content(build_body(path, window_start, window_end, rows))
     msg.add_attachment(payload, maintype=maintype, subtype=subtype, filename=path.name)
 
     if settings.dry_run:
@@ -336,15 +433,27 @@ def login_test(settings: Settings) -> None:
 # Main
 # --------------------------------------------------------------------------- #
 
+def optional_path(text: str) -> Optional[Path]:
+    """An empty --file, as the workflow passes on a quiet day, means no file."""
+    text = (text or "").strip()
+    return Path(text) if text else None
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Email the cancellation report.")
-    parser.add_argument("--file", type=Path, default=None, help="The .xlsx to attach.")
+    parser.add_argument("--file", type=optional_path, default=None,
+                        help="The .xlsx to attach. May be empty on a day with "
+                             "no cancellations.")
     parser.add_argument("--subject", default=env_value("EMAIL_SUBJECT", DEFAULT_SUBJECT))
     parser.add_argument("--to", default=None,
                         help="Recipients, comma separated. Defaults to EMAIL_RECIPIENTS "
                              "or the built-in list.")
     parser.add_argument("--window-start", default="", help="Shown in the body.")
     parser.add_argument("--window-end", default="", help="Shown in the body.")
+    parser.add_argument("--row-count", type=int, default=env_int("ROW_COUNT", -1),
+                        help="Canceled items the report holds. 0 sends the "
+                             "no-cancellations notice without an attachment. "
+                             "Negative means read the count from the workbook.")
     parser.add_argument("--login-test", action="store_true",
                         help="Connect and authenticate only, then exit.")
     return parser.parse_args(argv)
@@ -358,8 +467,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         login_test(settings)
         return 0
 
-    if args.file is None:
-        raise SystemExit("--file is required unless --login-test is used.")
+    if args.file is None and args.row_count != 0:
+        raise SystemExit(
+            "--file is required unless --login-test is used or --row-count is 0."
+        )
 
     recipients = (
         [part.strip() for part in re.split(r"[,;\s]+", args.to) if part.strip()]
@@ -374,6 +485,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.file,
         args.window_start,
         args.window_end,
+        args.row_count,
     )
     return 0
 
