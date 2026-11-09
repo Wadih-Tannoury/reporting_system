@@ -13,7 +13,9 @@ per item at `data.channel` (`Blooming`, `ecommerce`); the shipment's own
 `data.channel` is the integration that created it (`Order Connector`) and is
 used only when no item carries a channel. The filter works line by line: a mixed shipment keeps
 its non-B2B lines and loses the rest. A row whose channel cannot be determined
-is kept, so an unexpected payload never silently empties the report. The run log
+is kept, so an unexpected payload never silently empties the report. A row whose
+`cancellation_date` cannot be read is dropped, since the window is what the
+report is about and an unreadable date cannot be shown to fall inside it. The run log
 reports how many rows were dropped.
 
 | Sheet | Contents |
@@ -39,8 +41,13 @@ variable `EMAIL_RECIPIENTS` (comma separated) overrides it without a code
 change. The same file is also attached to the run as an artifact for 90 days,
 so a failed send never loses the data.
 
-On a day with no cancellations the email still goes out, with an empty workbook
-and a body saying so.
+On a day with no cancellations the email still goes out, with no attachment and
+the single line:
+
+> No DJ shipments were cancelled in the last 24 hours
+
+Over a custom window the line names the window instead. The artifact is still
+uploaded, so the empty workbook remains available from the run.
 
 ## Setup
 
@@ -175,6 +182,7 @@ Set these as `env:` on the report step, or shell variables locally.
 | `KIBO_TENANT_ID` | `30018` | Tenant |
 | `KIBO_SITE_IDS` | the ten sites | Comma-separated override |
 | `ALWAYS_WRITE_FILE` | `true` | Write an empty workbook when nothing was canceled, so the artifact always exists. Set `false` to skip the upload instead — the upload step then fails on a quiet day, since `if-no-files-found` is `error` |
+| `KEEP_UNDATED_ROWS` | `false` | Keep rows whose `cancellation_date` cannot be parsed. They are dropped by default, so the report holds only cancellations inside the window |
 | `EXCLUDE_CHANNELS` | `B2B` | Comma-separated channels to drop, case insensitive. Set to empty to keep every channel |
 | `EMAIL_RECIPIENTS` | the five DJ addresses | Comma-separated override |
 | `EMAIL_SUBJECT` | `DJ daily cancellation report` | Overridden by `--subject`, which the workflow passes explicitly |
