@@ -124,7 +124,9 @@ jobs:
         with:
           name: kibo-cancellations-${{ github.run_id }}
           path: output/*.xlsx
-          if-no-files-found: error
+          # A quiet day with ALWAYS_WRITE_FILE=false writes nothing, and the
+          # email step reports that on its own, so a missing file is a warning.
+          if-no-files-found: warn
           retention-days: 90
 
       - name: Email the report
@@ -146,12 +148,16 @@ jobs:
           REPORT_PATH: ${{ steps.report.outputs.report_path }}
           WINDOW_START: ${{ steps.report.outputs.window_start }}
           WINDOW_END: ${{ steps.report.outputs.window_end }}
+          # 0 makes the script send the no-cancellations notice with no
+          # attachment, so the team hears from the report every day.
+          ROW_COUNT: ${{ steps.report.outputs.row_count }}
         run: |
           python send_report_email.py \
             --file "$REPORT_PATH" \
             --subject "DJ daily cancellation report" \
             --window-start "$WINDOW_START" \
-            --window-end "$WINDOW_END"
+            --window-end "$WINDOW_END" \
+            --row-count "${ROW_COUNT:--1}"
 
       - name: Write the run summary
         if: always() && steps.guard.outputs.skip != 'true' && env.MODE != 'smtp-login-test'
