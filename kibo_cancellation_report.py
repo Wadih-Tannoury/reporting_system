@@ -11,6 +11,11 @@ shipments updated inside the date window, and reports two things:
 
 One Excel row per canceled item.
 
+Shipments whose status is REASSIGNED are left out entirely
+(EXCLUDE_SHIPMENT_STATUSES): the line did not die there, it moved on to
+another shipment, and that shipment reports the cancellation itself. They
+still feed item_location_history.
+
 Location history
 ----------------
 A canceled line has usually been passed around before dying: store A rejects
@@ -172,6 +177,20 @@ EXTRA_FILTER: Optional[str] = None
 # is something else but that carry canceled items (partial cancellations).
 INCLUDE_FULL = True
 INCLUDE_PARTIAL = True
+
+# --- shipment status exclusion --------------------------------------------- #
+# A shipment in one of these statuses never reaches the report, whatever it
+# carries. REASSIGNED is the default: the line did not die there, it was handed
+# to another store, and the shipment that finally canceled it is reported on its
+# own. Counting the reassignment too would show the same cancellation twice.
+# The reassigned shipment still contributes to item_location_history, which is
+# what that column is for. Comma separated, case insensitive; set to empty to
+# report every status.
+EXCLUDED_SHIPMENT_STATUSES = {
+    part.strip().upper()
+    for part in os.environ.get("EXCLUDE_SHIPMENT_STATUSES", "REASSIGNED").split(",")
+    if part.strip()
+}
 
 # --- channel exclusion ----------------------------------------------------- #
 # Kibo carries the channel per item, at data.channel ("ecommerce", "B2B", ...),
@@ -909,6 +928,14 @@ def is_excluded_channel(channel: Optional[str]) -> bool:
     return bool(channel) and channel.strip().lower() in EXCLUDED_CHANNELS
 
 
+def is_excluded_status(shipment: dict) -> bool:
+    """True when the shipment's status is one the report leaves out."""
+    if not EXCLUDED_SHIPMENT_STATUSES:
+        return False
+    status = str(shipment.get("shipmentStatus") or "").strip().upper()
+    return bool(status) and status in EXCLUDED_SHIPMENT_STATUSES
+
+
 def shipment_order_number_of(shipment: dict) -> Optional[str]:
     data = shipment.get("data") or {}
     return data.get("shipmentOrderNumber") or data.get("xpoOrderId")
@@ -1043,22 +1070,31 @@ def extract_rows(
     site_id: int,
     shipments: Sequence[dict],
     history: LocationHistory,
-) -> Tuple[List[Dict[str, Any]], int]:
+) -> Tuple[List[Dict[str, Any]], int, int]:
     """
-    One record per canceled item, plus the number of rows dropped by channel.
+    One record per canceled item, plus the rows dropped by channel and the
+    shipments dropped by status.
 
     A shipment qualifies when its status is CANCELED (full cancellation) or
-    when it carries canceled items despite another status (partial). Rows on an
-    excluded channel (B2B by default) are dropped before the location-history
-    lookup, so they cost no extra API calls.
+    when it carries canceled items despite another status (partial). A shipment
+    whose status is in EXCLUDED_SHIPMENT_STATUSES (REASSIGNED by default) is
+    skipped outright. Rows on an excluded channel (B2B by default) are dropped
+    before the location-history lookup, so they cost no extra API calls.
     """
     rows: List[Dict[str, Any]] = []
     excluded = 0
+    excluded_status = 0
 
     for shipment in shipments:
         status = str(shipment.get("shipmentStatus", "")).upper()
         canceled_items = shipment.get("canceledItems") or []
         full = status == "CANCELED"
+
+        # Checked first: a reassignment is not where the line died, so it never
+        # reaches the report however many canceled items it carries.
+        if is_excluded_status(shipment):
+            excluded_status += 1
+            continue
 
         if full and not INCLUDE_FULL:
             continue
@@ -1152,7 +1188,7 @@ def extract_rows(
                 }
             )
 
-    return rows, excluded
+    return rows, excluded, excluded_status
 
 
 # --------------------------------------------------------------------------- #
@@ -1316,6 +1352,10 @@ def trace_order(kibo: "KiboClient", order_id: str, start: datetime, end: datetim
                 log.info("      EXCLUDED: the walk never sees it -- its updateDate is outside "
                          "the queried window. Widen the window or the padding.")
                 continue
+            if is_excluded_status(shipment):
+                log.info("      EXCLUDED: shipment status %r is in "
+                         "EXCLUDE_SHIPMENT_STATUSES", status)
+                continue
             if not full and not canceled_items:
                 log.info("      not a cancellation: status is not CANCELED and nothing was canceled")
                 continue
@@ -1408,18 +1448,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     per_site: List[Tuple[int, int, int, int]] = []
 
     excluded_total = 0
+    excluded_status_total = 0
     for site_id, shipments in per_site_shipments:
-        rows, excluded = extract_rows(site_id, shipments, history)
+        rows, excluded, excluded_status = extract_rows(site_id, shipments, history)
         excluded_total += excluded
+        excluded_status_total += excluded_status
         full = sum(1 for r in rows if r["cancellation_type"] == "FULL")
         per_site.append((site_id, len(shipments), full, len(rows) - full))
         log.info(
-            "  site %s -> %s shipment(s) scanned, %s full + %s partial row(s)%s",
+            "  site %s -> %s shipment(s) scanned, %s full + %s partial row(s)%s%s",
             site_id,
             len(shipments),
             full,
             len(rows) - full,
             f", {excluded} excluded by channel" if excluded else "",
+            f", {excluded_status} excluded by status" if excluded_status else "",
         )
         records.extend(rows)
 
@@ -1428,6 +1471,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Excluded channel(s): %s -- %s row(s) dropped",
             ", ".join(sorted(EXCLUDED_CHANNELS)),
             excluded_total,
+        )
+
+    if EXCLUDED_SHIPMENT_STATUSES:
+        log.info(
+            "Excluded shipment status(es): %s -- %s shipment(s) dropped",
+            ", ".join(sorted(EXCLUDED_SHIPMENT_STATUSES)),
+            excluded_status_total,
         )
 
     log.info("Summary (site: shipments scanned / full rows / partial rows)")
