@@ -38,7 +38,7 @@ DEFAULT_RECIPIENTS: Sequence[str] = (
     "giulia.silvestro@ladoublej.com",
     "sabrina.baraldi@ladoublej.com",
     "sara.mattioli@ladoublej.com",
-    "giulia.piroli@ladoublej.com",
+    "giulia.piroli@thelevelgroup.com",
     "beatrice.cabrini@ladoublej.com",
 )
 
